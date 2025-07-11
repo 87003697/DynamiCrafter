@@ -16,6 +16,12 @@ from lvdm.models.samplers.ddim_multiplecond import DDIMSampler as DDIMSampler_mu
 from utils.utils import instantiate_from_config
 import random
 
+import numpy as np
+import cv2
+
+# 移除对 dynamicrafter_scheduler 的依赖
+# from dynamicrafter_scheduler import DynamiCrafterScheduler
+
 
 def get_filelist(data_dir, postfixes):
     patterns = [os.path.join(data_dir, f"*.{postfix}") for postfix in postfixes]
@@ -163,9 +169,66 @@ def get_latent_z(model, videos):
     return z
 
 
+def get_fixed_ddim_sampler(model, ddim_steps, ddim_eta, verbose=False):
+    """
+    返回修复后sigma值的DDIMSampler - 极简修复方案
+    只修复sigma计算，保持其他逻辑完全不变
+    """
+    sampler = DDIMSampler(model)
+    sampler.make_schedule(ddim_steps, ddim_discretize="uniform", ddim_eta=ddim_eta, verbose=verbose)
+    
+    # 关键修复：用DynamiCrafter原始函数重新计算sigma值
+    from lvdm.models.utils_diffusion import make_ddim_sampling_parameters
+    ddim_sigmas, ddim_alphas, ddim_alphas_prev = make_ddim_sampling_parameters(
+        alphacums=model.alphas_cumprod.cpu(),
+        ddim_timesteps=sampler.ddim_timesteps,
+        eta=ddim_eta,
+        verbose=False
+    )
+    
+    # 替换有问题的sigma值 - 统一处理为torch tensor
+    if isinstance(ddim_sigmas, torch.Tensor):
+        sampler.ddim_sigmas = ddim_sigmas.to(model.device)
+    else:
+        sampler.ddim_sigmas = torch.from_numpy(ddim_sigmas).to(model.device)
+    
+    if isinstance(ddim_alphas, torch.Tensor):
+        sampler.ddim_alphas = ddim_alphas.to(model.device)
+    else:
+        sampler.ddim_alphas = torch.from_numpy(ddim_alphas).to(model.device)
+    
+    if isinstance(ddim_alphas_prev, torch.Tensor):
+        sampler.ddim_alphas_prev = ddim_alphas_prev.to(model.device)
+    else:
+        sampler.ddim_alphas_prev = torch.from_numpy(ddim_alphas_prev).to(model.device)
+    
+    # 计算 ddim_sqrt_one_minus_alphas
+    if isinstance(ddim_alphas, torch.Tensor):
+        sampler.ddim_sqrt_one_minus_alphas = torch.sqrt(1. - ddim_alphas).to(model.device)
+    else:
+        sampler.ddim_sqrt_one_minus_alphas = torch.from_numpy(np.sqrt(1. - ddim_alphas)).to(model.device)
+    
+    if verbose:
+        print("✅ DDIMSampler fixed: sigma values replaced with numerically stable versions")
+    
+    return sampler
+
 def image_guided_synthesis(model, prompts, videos, noise_shape, n_samples=1, ddim_steps=50, ddim_eta=1., \
-                        unconditional_guidance_scale=1.0, cfg_img=None, fs=None, text_input=False, multiple_cond_cfg=False, loop=False, interp=False, timestep_spacing='uniform', guidance_rescale=0.0, **kwargs):
-    ddim_sampler = DDIMSampler(model) if not multiple_cond_cfg else DDIMSampler_multicond(model)
+                        unconditional_guidance_scale=1.0, cfg_img=None, fs=None, text_input=False, multiple_cond_cfg=False, loop=False, interp=False, timestep_spacing='uniform', guidance_rescale=0.0, use_fixed_scheduler=False, **kwargs):
+    
+    # 创建DDIMSampler - 原始或修复版本
+    if use_fixed_scheduler:
+        print("🔧 Using Fixed DDIMSampler (NaN-free)")
+        ddim_sampler = get_fixed_ddim_sampler(model, ddim_steps, ddim_eta, verbose=False)
+    else:
+        print("⚠️  Using Original DDIM Sampler")
+        if not multiple_cond_cfg:
+            ddim_sampler = DDIMSampler(model)
+        else:
+            ddim_sampler = DDIMSampler_multicond(model)
+        ddim_sampler.make_schedule(ddim_num_steps=ddim_steps, ddim_discretize=timestep_spacing, ddim_eta=ddim_eta, verbose=False)
+    
+    # 其余逻辑完全不变 - 使用原始的image_guided_synthesis逻辑
     batch_size = noise_shape[0]
     fs = torch.tensor([fs] * batch_size, dtype=torch.long, device=model.device)
 
@@ -304,7 +367,7 @@ def run_inference(args, gpu_num, gpu_no):
                 videos = videos.unsqueeze(0).to("cuda")
 
             batch_samples = image_guided_synthesis(model, prompts, videos, noise_shape, args.n_samples, args.ddim_steps, args.ddim_eta, \
-                                args.unconditional_guidance_scale, args.cfg_img, args.frame_stride, args.text_input, args.multiple_cond_cfg, args.loop, args.interp, args.timestep_spacing, args.guidance_rescale)
+                                args.unconditional_guidance_scale, args.cfg_img, args.frame_stride, args.text_input, args.multiple_cond_cfg, args.loop, args.interp, args.timestep_spacing, args.guidance_rescale, args.use_fixed_scheduler)
 
             ## save each example individually
             for nn, samples in enumerate(batch_samples):
@@ -340,6 +403,9 @@ def get_parser():
     parser.add_argument("--timestep_spacing", type=str, default="uniform", help="The way the timesteps should be scaled. Refer to Table 2 of the [Common Diffusion Noise Schedules and Sample Steps are Flawed](https://huggingface.co/papers/2305.08891) for more information.")
     parser.add_argument("--guidance_rescale", type=float, default=0.0, help="guidance rescale in [Common Diffusion Noise Schedules and Sample Steps are Flawed](https://huggingface.co/papers/2305.08891)")
     parser.add_argument("--perframe_ae", action='store_true', default=False, help="if we use per-frame AE decoding, set it to True to save GPU memory, especially for the model of 576x1024")
+    
+    # 新增参数：是否使用修复后的调度器
+    parser.add_argument("--use_fixed_scheduler", action='store_true', default=False, help="use fixed DynamiCrafter scheduler instead of original DDIM sampler")
 
     ## currently not support looping video and generative frame interpolation
     parser.add_argument("--loop", action='store_true', default=False, help="generate looping videos or not")
