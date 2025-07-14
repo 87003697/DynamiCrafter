@@ -8,3 +8,7 @@ checkpoints
 results
 backup
 LOG
+
+# 忽略输出目录
+outputs/
+results_dynamicrafter_guidance/
