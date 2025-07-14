@@ -1102,6 +1102,11 @@ class DynamiCrafterGuidancePipeline:
     def _csd_loss(self, latents, conditioning, cfg_scale=7.5, min_step_ratio=0.02, max_step_ratio=0.98, weight_type="ada"):
         """
         CSD loss 使用 DynamiCrafter 的 model.apply_model
+        
+        正确的 CSD (Classifier-Free Score Distillation) 实现：
+        - fake = 无条件预测的原始样本
+        - real = 引导预测 (CFG) 的原始样本
+        - 通过无条件和引导预测的差异来优化
         """
         batch_size = latents.shape[0]
         
@@ -1114,17 +1119,19 @@ class DynamiCrafterGuidancePipeline:
         
         # 准备条件
         cond = conditioning["cond"]
+        uc = conditioning["uc"]
         fs = conditioning["fs"]
         
-        # 前向传播
+        # 前向传播 - 分别计算无条件和条件预测
         with torch.no_grad():
-            # 低引导 (fake distribution)
-            noise_pred_fake = self.model.apply_model(noisy_latents, t, cond, **{"fs": fs})
+            # 条件预测
+            noise_pred_cond = self.model.apply_model(noisy_latents, t, cond, **{"fs": fs})
             
-            # 高引导 (real distribution) - 使用更高的噪声
-            noise_enhanced = noise * (1.0 + cfg_scale * 0.1)
-            noisy_latents_enhanced = self._add_noise(latents, noise_enhanced, t)
-            noise_pred_real = self.model.apply_model(noisy_latents_enhanced, t, cond, **{"fs": fs})
+            # 无条件预测
+            noise_pred_uncond = self.model.apply_model(noisy_latents, t, uc, **{"fs": fs})
+            
+            # 引导预测 (CFG)
+            noise_pred_guided = noise_pred_uncond + cfg_scale * (noise_pred_cond - noise_pred_uncond)
         
         # 计算预测的原始样本
         alpha_t = self.model.alphas_cumprod[t].to(self.device)
@@ -1134,8 +1141,9 @@ class DynamiCrafterGuidancePipeline:
         sqrt_alpha_t = torch.sqrt(alpha_t)
         sqrt_one_minus_alpha_t = torch.sqrt(1.0 - alpha_t)
         
-        pred_fake_latents = (noisy_latents - sqrt_one_minus_alpha_t * noise_pred_fake) / sqrt_alpha_t
-        pred_real_latents = (noisy_latents_enhanced - sqrt_one_minus_alpha_t * noise_pred_real) / sqrt_alpha_t
+        # CSD 的核心：对比无条件和引导预测
+        pred_fake_latents = (noisy_latents - sqrt_one_minus_alpha_t * noise_pred_uncond) / sqrt_alpha_t  # 无条件预测
+        pred_real_latents = (noisy_latents - sqrt_one_minus_alpha_t * noise_pred_guided) / sqrt_alpha_t   # 引导预测
         
         # 计算 CSD 梯度
         if weight_type == "ada":

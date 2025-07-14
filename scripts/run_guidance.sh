@@ -5,8 +5,8 @@
 # export CUDA_VISIBLE_DEVICES=3
 
 # Default settings
-IMAGE="prompts/1024/pour_bear.png"
-PROMPT="a beautiful sunset over mountains with birds flying"
+IMAGE="prompts/256/bear.png"
+PROMPT="a brown bear is walking in a zoo enclosure, some rocks around"
 
 echo "Running DynamiCrafter Guidance Pipeline..."
 echo "Image: $IMAGE"
@@ -20,7 +20,8 @@ python generate_dynamicrafter_pipeline.py \
     --num_frames 16 \
     --num_optimization_steps 1000 \
     --learning_rate 0.05 \
-    --loss_type sds \
+    --loss_type csd \
+    --weight_type ada \
     --cfg_scale 7.5 \
     --device cuda:3 \
     --save_results \
