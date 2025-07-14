@@ -1,373 +1,409 @@
 #!/bin/bash
 
-# =============================================================================
 # DynamiCrafter Guidance Pipeline Runner
-# =============================================================================
-# 
-# 使用说明：
-#   ./scripts/run_guidance.sh [选项]
-#
-# 选项：
-#   test          - 运行测试
-#   help          - 显示使用说明
-#   run           - 运行完整生成（需要指定图像和提示词）
-#   debug         - 调试模式运行
-#
-# 示例：
-#   ./scripts/run_guidance.sh test
-#   ./scripts/run_guidance.sh run "prompts/1024/pour_bear.png" "person walking in garden"
-#   ./scripts/run_guidance.sh debug
-#
-# =============================================================================
+# Enhanced version with comprehensive result saving
+# Updated: 2024-01-XX
 
-# 颜色定义
+# Color codes for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 PURPLE='\033[0;35m'
 CYAN='\033[0;36m'
+WHITE='\033[1;37m'
 NC='\033[0m' # No Color
 
-# 项目根目录
-PROJECT_ROOT=$(cd "$(dirname "$0")/.." && pwd)
-GUIDANCE_SCRIPT="$PROJECT_ROOT/guidance_pipeline.py"
+# Default parameters
+DEFAULT_IMAGE_DIR="prompts"
+DEFAULT_PROMPT_FILE="prompts/prompt.txt"
+DEFAULT_PROMPT="A beautiful landscape with flowing water"
+DEFAULT_STEPS=50
+DEFAULT_LR=0.01
+DEFAULT_LOSS_TYPE="sds"
+DEFAULT_CFG_SCALE=7.5
+DEFAULT_RESULTS_DIR="results_dynamicrafter_guidance"
+DEFAULT_DEBUG_INTERVAL=10
 
-# 日志函数
-log_info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
-}
+# Enhanced saving parameters
+DEFAULT_SAVE_RESULTS=true
+DEFAULT_SAVE_DEBUG_IMAGES=true
+DEFAULT_SAVE_DEBUG_VIDEOS=true
+DEFAULT_SAVE_PROCESS_VIDEO=true
 
-log_success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $1"
-}
-
-log_warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $1"
-}
-
-log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-}
-
-log_header() {
-    echo -e "${PURPLE}========================================${NC}"
-    echo -e "${PURPLE}$1${NC}"
-    echo -e "${PURPLE}========================================${NC}"
-}
-
-# 检查依赖
-check_dependencies() {
-    log_info "检查依赖..."
-    
-    # 检查 Python
-    if ! command -v python &> /dev/null; then
-        log_error "Python 未安装或未在 PATH 中"
-        exit 1
-    fi
-    
-    # 检查 CUDA（可选）
-    if command -v nvidia-smi &> /dev/null; then
-        log_success "检测到 CUDA 支持"
-        nvidia-smi --query-gpu=name,memory.total,memory.used --format=csv,noheader,nounits | head -1
-    else
-        log_warning "未检测到 CUDA，将使用 CPU 模式"
-    fi
-    
-    # 检查 guidance_pipeline.py
-    if [ ! -f "$GUIDANCE_SCRIPT" ]; then
-        log_error "找不到 guidance_pipeline.py 文件: $GUIDANCE_SCRIPT"
-        exit 1
-    fi
-    
-    log_success "依赖检查完成"
-}
-
-# 显示使用说明
-show_usage() {
-    log_header "DynamiCrafter Guidance Pipeline Runner"
+# Print header
+print_header() {
+    echo -e "${CYAN}╔════════════════════════════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║                         DynamiCrafter Guidance Pipeline Runner                         ║${NC}"
+    echo -e "${CYAN}║                              Enhanced Saving Version                                   ║${NC}"
+    echo -e "${CYAN}╚════════════════════════════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
-    echo -e "${CYAN}使用方法：${NC}"
-    echo "  $0 [选项]"
-    echo ""
-    echo -e "${CYAN}选项：${NC}"
-    echo "  test                          - 运行测试"
-    echo "  help                          - 显示使用说明"
-    echo "  run [image_path] [prompt]     - 运行完整生成（参数可选，有默认值）"
-    echo "  quick                         - 快速运行（使用默认参数，仅50步）"
-    echo "  debug                         - 调试模式运行"
-    echo "  info                          - 显示系统信息"
-    echo ""
-    echo -e "${CYAN}示例：${NC}"
-    echo "  $0 test"
-    echo "  $0 quick                                    # 快速测试，50步优化"
-    echo "  $0 run                                      # 使用默认图像和提示词"
-    echo "  $0 run \"image.jpg\"                         # 使用指定图像和默认提示词"
-    echo "  $0 run \"image.jpg\" \"person walking\"       # 使用指定图像和提示词"
-    echo "  $0 debug"
-    echo "  $0 info"
-    echo ""
-    echo -e "${CYAN}默认值：${NC}"
-    echo "  默认图像: 自动查找 prompts/ 目录下的测试图像"
-    echo "  默认提示词: 'a person walking in a beautiful garden with flowers blooming'"
-    echo ""
-    echo -e "${CYAN}环境变量：${NC}"
-    echo "  CUDA_VISIBLE_DEVICES          - 指定使用的 GPU"
-    echo "  RESOLUTION                    - 视频分辨率 (256_256, 512_512, 1024_1024)"
-    echo "  STEPS                         - 优化步数 (默认: 1000)"
-    echo "  LOSS_TYPE                     - 损失类型 (sds, csd, rfds)"
-    echo "  CFG_SCALE                     - CFG 比例 (默认: 7.5)"
-    echo ""
-    echo -e "${CYAN}示例使用环境变量：${NC}"
-    echo "  RESOLUTION=512_512 STEPS=500 $0 run"
-    echo "  CUDA_VISIBLE_DEVICES=0 LOSS_TYPE=sds $0 run \"image.jpg\" \"prompt\""
-    echo ""
-    echo -e "${CYAN}支持的测试图像位置：${NC}"
-    echo "  - prompts/1024/pour_bear.png"
-    echo "  - prompts/512_loop/24.png"
-    echo "  - prompts/256/art.png"
-    echo "  - prompts/256/bear.png"
-    echo "  - prompts/1024/girl07.png"
-    echo "  - prompts/512_loop/36.png"
 }
 
-# 运行测试
-run_test() {
-    log_header "运行 DynamiCrafter Guidance Pipeline 测试"
-    
-    check_dependencies
-    
-    log_info "开始测试..."
-    log_info "脚本路径: $GUIDANCE_SCRIPT"
-    
-    # 设置环境变量
-    export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
-    
-    # 切换到项目根目录
-    cd "$PROJECT_ROOT"
-    
-    # 运行测试
-    python "$GUIDANCE_SCRIPT" test
-    
-    local exit_code=$?
-    if [ $exit_code -eq 0 ]; then
-        log_success "测试完成！"
-        log_info "结果保存在: ./results_dynamicrafter_guidance/"
-        log_info "调试视频保存在: ./debug_dynamicrafter_guidance/"
-    else
-        log_error "测试失败，退出码: $exit_code"
-        exit $exit_code
-    fi
+# Print help
+print_help() {
+    echo -e "${WHITE}Usage: $0 [MODE] [OPTIONS]${NC}"
+    echo ""
+    echo -e "${YELLOW}MODES:${NC}"
+    echo -e "  ${GREEN}test${NC}     - Quick test run (10 steps, basic saving)"
+    echo -e "  ${GREEN}run${NC}      - Full optimization run (50 steps, enhanced saving)"
+    echo -e "  ${GREEN}debug${NC}    - Debug mode with frequent saves (20 steps, interval=5)"
+    echo -e "  ${GREEN}quick${NC}    - Quick generation (25 steps, standard saving)"
+    echo -e "  ${GREEN}info${NC}     - Show system information"
+    echo -e "  ${GREEN}help${NC}     - Show this help message"
+    echo ""
+    echo -e "${YELLOW}OPTIONS:${NC}"
+    echo -e "  ${BLUE}--image PATH${NC}            Input image path (auto-detects from prompts/ if not specified)"
+    echo -e "  ${BLUE}--prompt TEXT${NC}           Text prompt (reads from prompts/prompt.txt if not specified)"  
+    echo -e "  ${BLUE}--steps N${NC}               Number of optimization steps (default: $DEFAULT_STEPS)"
+    echo -e "  ${BLUE}--lr FLOAT${NC}              Learning rate (default: $DEFAULT_LR)"
+    echo -e "  ${BLUE}--loss TYPE${NC}             Loss type: sds, csd, rfds (default: $DEFAULT_LOSS_TYPE)"
+    echo -e "  ${BLUE}--cfg_scale FLOAT${NC}       CFG scale (default: $DEFAULT_CFG_SCALE)"
+    echo -e "  ${BLUE}--results_dir PATH${NC}      Results directory (default: $DEFAULT_RESULTS_DIR)"
+    echo -e "  ${BLUE}--debug_interval N${NC}      Debug save interval (default: $DEFAULT_DEBUG_INTERVAL)"
+    echo ""
+    echo -e "${YELLOW}ENHANCED SAVING OPTIONS:${NC}"
+    echo -e "  ${BLUE}--save_results BOOL${NC}     Enable organized result saving (default: $DEFAULT_SAVE_RESULTS)"
+    echo -e "  ${BLUE}--save_debug_images BOOL${NC} Save debug images (default: $DEFAULT_SAVE_DEBUG_IMAGES)"
+    echo -e "  ${BLUE}--save_debug_videos BOOL${NC} Save debug videos (default: $DEFAULT_SAVE_DEBUG_VIDEOS)"
+    echo -e "  ${BLUE}--save_process_video BOOL${NC} Create optimization process video (default: $DEFAULT_SAVE_PROCESS_VIDEO)"
+    echo ""
+    echo -e "${YELLOW}EXAMPLES:${NC}"
+    echo -e "  ${GREEN}$0 test${NC}                                    # Quick test"
+    echo -e "  ${GREEN}$0 run --steps 100 --lr 0.05${NC}              # Full run with custom parameters"
+    echo -e "  ${GREEN}$0 debug --image my_image.jpg${NC}              # Debug mode with specific image"
+    echo -e "  ${GREEN}$0 quick --prompt \"A serene mountain lake\"${NC}  # Quick run with custom prompt"
+    echo ""
 }
 
-# 运行完整生成
-run_generation() {
-    local image_path="$1"
-    local prompt="$2"
+# Auto-detect image file
+auto_detect_image() {
+    local image_dir="$1"
     
-    # === 新增：为参数提供默认值 ===
-    # 如果没有提供图像路径，使用默认的测试图像
-    if [ -z "$image_path" ]; then
-        log_info "未提供图像路径，尝试使用默认测试图像..."
-        
-        # 按优先级查找测试图像
-        local test_images=(
-            "prompts/1024/pour_bear.png"
-            "prompts/512_loop/24.png"
-            "prompts/256/art.png"
-            "prompts/256/bear.png"
-            "prompts/1024/girl07.png"
-            "prompts/512_loop/36.png"
-        )
-        
-        for test_img in "${test_images[@]}"; do
-            if [ -f "$test_img" ]; then
-                image_path="$test_img"
-                log_info "使用默认图像: $image_path"
-                break
+    if [ -d "$image_dir" ]; then
+        # First, look for common image extensions in the root directory
+        for ext in jpg jpeg png bmp tiff webp; do
+            local found_file=$(find "$image_dir" -maxdepth 1 -iname "*.$ext" -type f | head -1)
+            if [ -n "$found_file" ]; then
+                echo "$found_file"
+                return 0
             fi
         done
         
-        # 如果仍然没有找到图像，提示用户
-        if [ -z "$image_path" ]; then
-            log_error "未找到默认测试图像，请提供图像路径"
-            echo "使用方法: $0 run <image_path> [prompt]"
-            echo "或将测试图像放在以下位置之一："
-            for test_img in "${test_images[@]}"; do
-                echo "  - $test_img"
-            done
-            exit 1
+        # If not found in root, search in subdirectories
+        for ext in jpg jpeg png bmp tiff webp; do
+            local found_file=$(find "$image_dir" -maxdepth 2 -iname "*.$ext" -type f | head -1)
+            if [ -n "$found_file" ]; then
+                echo "$found_file"
+                return 0
+            fi
+        done
+    fi
+    
+    return 1
+}
+
+# Auto-detect prompt
+auto_detect_prompt() {
+    local prompt_file="$1"
+    
+    # Try to read from prompt file
+    if [ -f "$prompt_file" ]; then
+        local prompt=$(cat "$prompt_file" | head -1 | xargs)
+        if [ -n "$prompt" ]; then
+            echo "$prompt"
+            return 0
         fi
     fi
     
-    # 如果没有提供提示词，使用默认提示词
+    # Try to read from test_prompts.txt in subdirectories
+    for subdir in prompts/*/; do
+        if [ -f "${subdir}test_prompts.txt" ]; then
+            local prompt=$(cat "${subdir}test_prompts.txt" | head -1 | xargs)
+            if [ -n "$prompt" ]; then
+                echo "$prompt"
+                return 0
+            fi
+        fi
+    done
+    
+    # Use default prompt if nothing found
+    echo "$DEFAULT_PROMPT"
+    return 0
+}
+
+# Show system information
+show_system_info() {
+    echo -e "${CYAN}System Information:${NC}"
+    echo -e "  ${BLUE}Python:${NC} $(python --version 2>&1)"
+    echo -e "  ${BLUE}PyTorch:${NC} $(python -c "import torch; print(torch.__version__)" 2>/dev/null || echo 'Not installed')"
+    echo -e "  ${BLUE}CUDA Available:${NC} $(python -c "import torch; print(torch.cuda.is_available())" 2>/dev/null || echo 'Unknown')"
+    echo -e "  ${BLUE}GPU Count:${NC} $(python -c "import torch; print(torch.cuda.device_count())" 2>/dev/null || echo 'Unknown')"
+    echo -e "  ${BLUE}Current GPU:${NC} $(nvidia-smi -L 2>/dev/null | head -1 || echo 'No GPU info')"
+    echo -e "  ${BLUE}Working Directory:${NC} $(pwd)"
+    echo -e "  ${BLUE}DynamiCrafter:${NC} $([ -f "guidance_pipeline.py" ] && echo 'Available' || echo 'Not found')"
+    echo ""
+}
+
+# Run the pipeline
+run_pipeline() {
+    local mode="$1"
+    shift
+    
+    # Parse arguments
+    local image_path=""
+    local prompt=""
+    local steps="$DEFAULT_STEPS"
+    local lr="$DEFAULT_LR"
+    local loss_type="$DEFAULT_LOSS_TYPE"
+    local cfg_scale="$DEFAULT_CFG_SCALE"
+    local results_dir="$DEFAULT_RESULTS_DIR"
+    local debug_interval="$DEFAULT_DEBUG_INTERVAL"
+    
+    # Enhanced saving parameters
+    local save_results="$DEFAULT_SAVE_RESULTS"
+    local save_debug_images="$DEFAULT_SAVE_DEBUG_IMAGES"
+    local save_debug_videos="$DEFAULT_SAVE_DEBUG_VIDEOS"
+    local save_process_video="$DEFAULT_SAVE_PROCESS_VIDEO"
+    
+    # Parse command line arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --image)
+                image_path="$2"
+                shift 2
+                ;;
+            --prompt)
+                prompt="$2"
+                shift 2
+                ;;
+            --steps)
+                steps="$2"
+                shift 2
+                ;;
+            --lr)
+                lr="$2"
+                shift 2
+                ;;
+            --loss)
+                loss_type="$2"
+                shift 2
+                ;;
+            --cfg_scale)
+                cfg_scale="$2"
+                shift 2
+                ;;
+            --results_dir)
+                results_dir="$2"
+                shift 2
+                ;;
+            --debug_interval)
+                debug_interval="$2"
+                shift 2
+                ;;
+            --save_results)
+                save_results="$2"
+                shift 2
+                ;;
+            --save_debug_images)
+                save_debug_images="$2"
+                shift 2
+                ;;
+            --save_debug_videos)
+                save_debug_videos="$2"
+                shift 2
+                ;;
+            --save_process_video)
+                save_process_video="$2"
+                shift 2
+                ;;
+            *)
+                echo -e "${RED}Unknown option: $1${NC}"
+                exit 1
+                ;;
+        esac
+    done
+    
+    # Set mode-specific parameters
+    case "$mode" in
+        "test")
+            steps=10
+            debug_interval=5
+            save_debug_images=false
+            save_debug_videos=true
+            save_process_video=false
+            ;;
+        "run")
+            steps=50
+            debug_interval=10
+            save_debug_images=true
+            save_debug_videos=true
+            save_process_video=true
+            ;;
+        "debug")
+            steps=20
+            debug_interval=5
+            save_debug_images=true
+            save_debug_videos=true
+            save_process_video=true
+            ;;
+        "quick")
+            steps=25
+            debug_interval=10
+            save_debug_images=false
+            save_debug_videos=true
+            save_process_video=false
+            ;;
+    esac
+    
+    # Auto-detect image if not specified
+    if [ -z "$image_path" ]; then
+        echo -e "${YELLOW}Auto-detecting image...${NC}"
+        image_path=$(auto_detect_image "$DEFAULT_IMAGE_DIR")
+        if [ -z "$image_path" ]; then
+            echo -e "${RED}Error: No image found in $DEFAULT_IMAGE_DIR${NC}"
+            echo -e "${WHITE}Please specify an image with --image PATH${NC}"
+            exit 1
+        fi
+        echo -e "${GREEN}Found image: $image_path${NC}"
+    fi
+    
+    # Auto-detect prompt if not specified
     if [ -z "$prompt" ]; then
-        log_info "未提供提示词，使用默认提示词..."
-        prompt="a person walking in a beautiful garden with flowers blooming"
-        log_info "使用默认提示词: $prompt"
+        echo -e "${YELLOW}Auto-detecting prompt...${NC}"
+        prompt=$(auto_detect_prompt "$DEFAULT_PROMPT_FILE")
+        echo -e "${GREEN}Using prompt: $prompt${NC}"
     fi
     
-    log_header "运行 DynamiCrafter Guidance Pipeline 生成"
+    # Print configuration
+    echo -e "${CYAN}Configuration:${NC}"
+    echo -e "  ${BLUE}Mode:${NC} $mode"
+    echo -e "  ${BLUE}Image:${NC} $image_path"
+    echo -e "  ${BLUE}Prompt:${NC} $prompt"
+    echo -e "  ${BLUE}Steps:${NC} $steps"
+    echo -e "  ${BLUE}Learning Rate:${NC} $lr"
+    echo -e "  ${BLUE}Loss Type:${NC} $loss_type"
+    echo -e "  ${BLUE}CFG Scale:${NC} $cfg_scale"
+    echo -e "  ${BLUE}Results Directory:${NC} $results_dir"
+    echo -e "  ${BLUE}Debug Interval:${NC} $debug_interval"
+    echo -e "${CYAN}Enhanced Saving:${NC}"
+    echo -e "  ${BLUE}Save Results:${NC} $save_results"
+    echo -e "  ${BLUE}Save Debug Images:${NC} $save_debug_images"
+    echo -e "  ${BLUE}Save Debug Videos:${NC} $save_debug_videos"
+    echo -e "  ${BLUE}Save Process Video:${NC} $save_process_video"
+    echo ""
     
-    check_dependencies
+    # Create results directory
+    mkdir -p "$results_dir"
     
-    # 检查图像文件
-    if [ ! -f "$image_path" ]; then
-        log_error "图像文件不存在: $image_path"
-        exit 1
-    fi
+    # Run the pipeline
+    echo -e "${GREEN}Starting DynamiCrafter Guidance Pipeline...${NC}"
+    echo -e "${WHITE}Press Ctrl+C to stop${NC}"
+    echo ""
     
-    log_info "图像路径: $image_path"
-    log_info "提示词: $prompt"
+    # Set environment variables
+    export CUDA_VISIBLE_DEVICES=0
+    export PYTHONPATH="$PYTHONPATH:$(pwd)"
+    export PROMPT_TEXT="$prompt"
     
-    # 环境变量设置
-    local resolution="${RESOLUTION:-256_256}"
-    local steps="${STEPS:-1000}"
-    local loss_type="${LOSS_TYPE:-sds}"
-    local cfg_scale="${CFG_SCALE:-7.5}"
+    # Convert shell boolean to Python boolean
+    local py_save_results=$([ "$save_results" = "true" ] && echo "True" || echo "False")
+    local py_save_debug_images=$([ "$save_debug_images" = "true" ] && echo "True" || echo "False")
+    local py_save_debug_videos=$([ "$save_debug_videos" = "true" ] && echo "True" || echo "False")
+    local py_save_process_video=$([ "$save_process_video" = "true" ] && echo "True" || echo "False")
     
-    log_info "分辨率: $resolution"
-    log_info "优化步数: $steps"
-    log_info "损失类型: $loss_type"
-    log_info "CFG 比例: $cfg_scale"
-    
-    # 设置环境变量
-    export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
-    
-    # 切换到项目根目录
-    cd "$PROJECT_ROOT"
-    
-    # 创建 Python 脚本运行生成
-    cat > run_temp.py << EOF
+    # Build Python command
+    local python_cmd="python -c \"
+import sys
+import os
+sys.path.insert(0, '.')
 from guidance_pipeline import DynamiCrafterGuidancePipeline
 from PIL import Image
-import os
+import torch
 
-# 初始化 pipeline
-pipeline = DynamiCrafterGuidancePipeline(resolution='$resolution')
+# Initialize pipeline
+pipeline = DynamiCrafterGuidancePipeline()
 
-# 加载图像
-image = Image.open('$image_path')
+# Load image
+image = Image.open('$image_path').convert('RGB')
 
-# 运行生成
+# Get prompt from environment variable
+prompt = os.environ.get('PROMPT_TEXT', '$DEFAULT_PROMPT')
+
+# Run optimization
 result = pipeline(
     image=image,
-    prompt='$prompt',
+    prompt=prompt,
     num_optimization_steps=$steps,
+    learning_rate=$lr,
     loss_type='$loss_type',
     cfg_scale=$cfg_scale,
-    save_debug_videos=True,
-    debug_save_interval=100,
-    debug_save_path='./debug_dynamicrafter_guidance',
-    return_dict=True
+    save_results=$py_save_results,
+    results_dir='$results_dir',
+    save_debug_images=$py_save_debug_images,
+    save_debug_videos=$py_save_debug_videos,
+    save_process_video=$py_save_process_video,
+    debug_save_interval=$debug_interval,
+    output_type='tensor'
 )
 
-# 保存视频
-output_dir = './results_dynamicrafter_guidance/'
-os.makedirs(output_dir, exist_ok=True)
-output_path = os.path.join(output_dir, 'generated_video.mp4')
-
-pipeline.save_video(result['videos'], output_path)
-print(f"✅ 视频生成完成: {output_path}")
-EOF
-
-    # 运行生成
-    python run_temp.py
+print('\\n🎉 Pipeline completed successfully!')
+print(f'📁 Results saved to: $results_dir')
+\""
+    
+    # Execute the command
+    eval "$python_cmd"
     
     local exit_code=$?
-    
-    # 清理临时文件
-    rm -f run_temp.py
-    
     if [ $exit_code -eq 0 ]; then
-        log_success "生成完成！"
-        log_info "结果保存在: ./results_dynamicrafter_guidance/"
-        log_info "调试视频保存在: ./debug_dynamicrafter_guidance/"
+        echo -e "${GREEN}✅ Pipeline completed successfully!${NC}"
+        echo -e "${CYAN}📁 Results saved to: $results_dir${NC}"
+        
+        # Show output structure
+        if [ "$save_results" = "true" ]; then
+            echo -e "${CYAN}📋 Output structure:${NC}"
+            find "$results_dir" -type d -name "*$(date +%Y%m%d)*" -exec ls -la {} \; 2>/dev/null | head -20
+        fi
     else
-        log_error "生成失败，退出码: $exit_code"
+        echo -e "${RED}❌ Pipeline failed with exit code: $exit_code${NC}"
         exit $exit_code
     fi
 }
 
-# 调试模式运行
-run_debug() {
-    log_header "调试模式运行 DynamiCrafter Guidance Pipeline"
+# Main script logic
+main() {
+    print_header
     
-    check_dependencies
-    
-    log_info "开始调试模式..."
-    
-    # 设置环境变量
-    export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
-    export CUDA_LAUNCH_BLOCKING=1  # 调试 CUDA 错误
-    
-    # 切换到项目根目录
-    cd "$PROJECT_ROOT"
-    
-    # 运行 Python 调试器
-    python -m pdb "$GUIDANCE_SCRIPT" test
-}
-
-# 显示系统信息
-show_system_info() {
-    log_header "系统信息"
-    
-    echo -e "${CYAN}Python 版本：${NC}"
-    python --version
-    
-    echo -e "${CYAN}工作目录：${NC}"
-    pwd
-    
-    echo -e "${CYAN}项目根目录：${NC}"
-    echo "$PROJECT_ROOT"
-    
-    echo -e "${CYAN}GPU 信息：${NC}"
-    if command -v nvidia-smi &> /dev/null; then
-        nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free --format=csv,noheader
-    else
-        echo "未检测到 NVIDIA GPU"
+    # Handle no arguments
+    if [ $# -eq 0 ]; then
+        echo -e "${YELLOW}No arguments provided. Use '$0 help' for usage information.${NC}"
+        echo -e "${GREEN}Running in 'quick' mode by default...${NC}"
+        echo ""
+        run_pipeline "quick"
+        return
     fi
     
-    echo -e "${CYAN}环境变量：${NC}"
-    echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-未设置}"
-    echo "RESOLUTION: ${RESOLUTION:-256_256 (默认)}"
-    echo "STEPS: ${STEPS:-1000 (默认)}"
-    echo "LOSS_TYPE: ${LOSS_TYPE:-sds (默认)}"
-    echo "CFG_SCALE: ${CFG_SCALE:-7.5 (默认)}"
-}
-
-# 主函数
-main() {
-    case "${1:-help}" in
-        "test")
-            run_test
-            ;;
-        "help"|"--help"|"-h")
-            show_usage
-            ;;
-        "run")
-            run_generation "$2" "$3"
-            ;;
-        "quick")
-            # 快速运行：使用默认参数的简化版本
-            log_header "快速运行 DynamiCrafter Guidance Pipeline"
-            log_info "使用默认参数进行快速测试..."
-            STEPS=50 run_generation
-            ;;
-        "debug")
-            run_debug
+    # Handle mode
+    local mode="$1"
+    shift
+    
+    case "$mode" in
+        "test"|"run"|"debug"|"quick")
+            run_pipeline "$mode" "$@"
             ;;
         "info")
             show_system_info
             ;;
+        "help"|"-h"|"--help")
+            print_help
+            ;;
         *)
-            log_info "显示使用说明..."
-            python "$GUIDANCE_SCRIPT"
-            echo ""
-            show_usage
+            echo -e "${RED}Unknown mode: $mode${NC}"
+            echo -e "${WHITE}Use '$0 help' for available modes.${NC}"
+            exit 1
             ;;
     esac
 }
 
-# 运行主函数
+# Execute main function
 main "$@"

@@ -13,22 +13,40 @@ DynamiCrafter Guidance Pipeline
 """
 
 import os
+import sys
+import json
 import time
-import torch
-import torch.nn.functional as F
-import numpy as np
-from typing import Optional, Union, List, Any, Dict, Callable
+import shutil
+import gc
+from pathlib import Path
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple, Union, Any
 from dataclasses import dataclass
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.cuda.amp import autocast
+import cv2
+from PIL import Image
+import imageio
 from omegaconf import OmegaConf
-from einops import repeat, rearrange
+from einops import rearrange, repeat
+from contextlib import contextmanager
 import torchvision.transforms as transforms
+
+# DynamiCrafter imports - 来自 scripts/evaluation/funcs.py
+from scripts.evaluation.funcs import load_model_checkpoint, save_videos, get_latent_z
+
+# 添加 DynamiCrafter 根目录到 Python 路径
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# Additional imports for enhanced saving
 from pytorch_lightning import seed_everything
 from huggingface_hub import hf_hub_download
-from PIL import Image
 
-# DynamiCrafter imports - 来自 scripts/gradio/dynamicrafter_pipeline.py
+# Additional DynamiCrafter imports
 from utils.utils import instantiate_from_config
-from scripts.evaluation.funcs import load_model_checkpoint, save_videos, get_latent_z
 from lvdm.models.utils_diffusion import make_ddim_sampling_parameters
 
 
@@ -65,6 +83,240 @@ class DynamiCrafterGuidanceConfig:
     save_debug_videos: bool = False  # 原来是 save_debug_images
     debug_save_interval: int = 100
     debug_save_path: str = "debug_videos"  # 原来是 debug_images
+
+
+def create_output_structure(base_dir: str, prompt: str, guidance_scale: float, 
+                           num_inference_steps: int) -> Dict[str, str]:
+    """Create organized output directory structure with descriptive naming."""
+    
+    # Create timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Create safe prompt name (remove special characters)
+    safe_prompt = "".join(c for c in prompt if c.isalnum() or c in (' ', '-', '_')).rstrip()
+    safe_prompt = safe_prompt.replace(' ', '_')[:50]  # Truncate long prompts
+    
+    # Create main output directory
+    output_name = f"{timestamp}_{safe_prompt}_gs{guidance_scale}_steps{num_inference_steps}"
+    main_dir = os.path.join(base_dir, output_name)
+    
+    # Create subdirectories
+    dirs = {
+        'main': main_dir,
+        'inputs': os.path.join(main_dir, 'inputs'),
+        'outputs': os.path.join(main_dir, 'outputs'),
+        'debug': os.path.join(main_dir, 'debug'),
+        'process': os.path.join(main_dir, 'process'),
+        'params': os.path.join(main_dir, 'params')
+    }
+    
+    # Create all directories
+    for dir_path in dirs.values():
+        os.makedirs(dir_path, exist_ok=True)
+    
+    return dirs
+
+def save_parameters(params_dir: str, **kwargs):
+    """Save all parameters to structured files."""
+    
+    # Save main parameters as JSON
+    params_file = os.path.join(params_dir, 'parameters.json')
+    with open(params_file, 'w') as f:
+        json.dump(kwargs, f, indent=2, default=str)
+    
+    # Save readable text format
+    txt_file = os.path.join(params_dir, 'parameters.txt')
+    with open(txt_file, 'w') as f:
+        f.write(f"DynamiCrafter Guidance Pipeline Parameters\n")
+        f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write("=" * 50 + "\n\n")
+        
+        for key, value in kwargs.items():
+            f.write(f"{key}: {value}\n")
+    
+    print(f"Parameters saved to: {params_file}")
+
+def save_input_conditions(inputs_dir: str, image_path: str, prompt: str, 
+                         processed_image: torch.Tensor):
+    """Save input conditions: original image, processed image, and prompt."""
+    
+    # Copy original image
+    if os.path.exists(image_path):
+        shutil.copy2(image_path, os.path.join(inputs_dir, 'original_image.png'))
+    
+    # Save processed image
+    if processed_image is not None:
+        # Convert tensor to PIL Image
+        if len(processed_image.shape) == 4:
+            processed_image = processed_image[0]  # Remove batch dimension
+        
+        # Ensure proper format
+        if processed_image.shape[0] == 3:  # CHW format
+            processed_image = processed_image.permute(1, 2, 0)  # HWC format
+        
+        processed_image = processed_image.cpu().numpy()
+        if processed_image.max() <= 1.0:
+            processed_image = (processed_image * 255).astype(np.uint8)
+        
+        processed_pil = Image.fromarray(processed_image)
+        processed_pil.save(os.path.join(inputs_dir, 'processed_image.png'))
+    
+    # Save prompt
+    with open(os.path.join(inputs_dir, 'prompt.txt'), 'w') as f:
+        f.write(prompt)
+    
+    print(f"Input conditions saved to: {inputs_dir}")
+
+def save_debug_images(debug_dir: str, step: int, latents: torch.Tensor, 
+                     model, first_stage_model, device: str):
+    """Save debug images with proper memory management."""
+    
+    try:
+        with torch.no_grad():
+            # 确保latents格式正确 (5D: batch, channels, time, height, width)
+            if latents.device != torch.device(device):
+                debug_latents = latents.to(device)
+            else:
+                debug_latents = latents.clone()
+            
+            # 解码每一帧 - DynamiCrafter需要4D输入
+            batch_size, channels, num_frames, height, width = debug_latents.shape
+            
+            # 重塑为4D: (batch*time, channels, height, width)
+            debug_latents_4d = debug_latents.permute(0, 2, 1, 3, 4).contiguous()
+            debug_latents_4d = debug_latents_4d.view(-1, channels, height, width)
+            
+            # 解码所有帧
+            if device == 'cuda':
+                with autocast():
+                    decoded = first_stage_model.decode(debug_latents_4d)
+            else:
+                decoded = first_stage_model.decode(debug_latents_4d)
+            
+            # 重塑回5D格式
+            decoded_channels = decoded.shape[1]
+            decoded_height = decoded.shape[2]
+            decoded_width = decoded.shape[3]
+            decoded = decoded.view(batch_size, num_frames, decoded_channels, decoded_height, decoded_width)
+            decoded = decoded.permute(0, 2, 1, 3, 4)  # (batch, channels, time, height, width)
+            
+            # 转换为numpy
+            if isinstance(decoded, torch.Tensor):
+                decoded = decoded.detach().cpu().numpy()
+            
+            # 保存每一帧
+            for t in range(num_frames):
+                frame = decoded[0, :, t, :, :]  # (channels, height, width)
+                
+                # 转换为HWC格式
+                if frame.shape[0] == 3:  # RGB
+                    frame = np.transpose(frame, (1, 2, 0))  # HWC
+                
+                # 归一化到0-255
+                if frame.max() <= 1.0:
+                    frame = (frame * 255).astype(np.uint8)
+                else:
+                    frame = np.clip(frame, 0, 255).astype(np.uint8)
+                
+                # 保存帧
+                frame_path = os.path.join(debug_dir, f'step_{step:03d}_frame_{t:03d}.png')
+                Image.fromarray(frame).save(frame_path)
+            
+            # 清理内存
+            del debug_latents, debug_latents_4d, decoded
+            torch.cuda.empty_cache() if device == 'cuda' else None
+            
+    except Exception as e:
+        print(f"Warning: Could not save debug images for step {step}: {e}")
+
+def save_debug_video(debug_dir: str, step: int, latents: torch.Tensor, 
+                    model, first_stage_model, device: str):
+    """Save debug video with proper tensor handling."""
+    
+    try:
+        with torch.no_grad():
+            # 确保latents格式正确
+            if latents.device != torch.device(device):
+                debug_latents = latents.to(device)
+            else:
+                debug_latents = latents.clone()
+            
+            # 使用模型的decode_first_stage方法 - 这个方法可以处理5D张量
+            if device == 'cuda':
+                with autocast():
+                    decoded = model.decode_first_stage(debug_latents)
+            else:
+                decoded = model.decode_first_stage(debug_latents)
+            
+            # 转换为numpy
+            if isinstance(decoded, torch.Tensor):
+                video_np = decoded.detach().cpu().numpy()
+            else:
+                video_np = decoded
+            
+            # 处理视频格式 (batch, channels, time, height, width)
+            if len(video_np.shape) == 5:
+                # 取第一个batch
+                video_np = video_np[0]  # (channels, time, height, width)
+                
+                # 转换为 (time, height, width, channels)
+                video_np = np.transpose(video_np, (1, 2, 3, 0))
+                
+                # 归一化到0-255
+                if video_np.max() <= 1.0:
+                    video_np = (video_np * 255).astype(np.uint8)
+                else:
+                    video_np = np.clip(video_np, 0, 255).astype(np.uint8)
+                
+                # 保存视频
+                video_path = os.path.join(debug_dir, f'step_{step:03d}_video.mp4')
+                imageio.mimwrite(video_path, video_np, fps=8, quality=7)
+            
+            # 清理内存
+            del debug_latents, decoded, video_np
+            torch.cuda.empty_cache() if device == 'cuda' else None
+            
+    except Exception as e:
+        print(f"Warning: Could not save debug video for step {step}: {e}")
+
+def create_optimization_process_video(process_dir: str, debug_dir: str, 
+                                    total_steps: int, fps: int = 2):
+    """Create a video showing the optimization process."""
+    
+    try:
+        # Find all debug videos
+        debug_videos = []
+        for step in range(total_steps):
+            video_path = os.path.join(debug_dir, f'step_{step:03d}_video.mp4')
+            if os.path.exists(video_path):
+                debug_videos.append(video_path)
+        
+        if not debug_videos:
+            print("No debug videos found for process video creation")
+            return
+        
+        # Create process video by combining frames from each step
+        process_frames = []
+        
+        for video_path in debug_videos:
+            try:
+                # Read video and take first frame
+                reader = imageio.get_reader(video_path)
+                first_frame = reader.get_data(0)
+                process_frames.append(first_frame)
+                reader.close()
+            except Exception as e:
+                print(f"Warning: Could not read frame from {video_path}: {e}")
+                continue
+        
+        if process_frames:
+            # Save optimization process video
+            process_video_path = os.path.join(process_dir, 'optimization_process.mp4')
+            imageio.mimwrite(process_video_path, process_frames, fps=fps, quality=7)
+            print(f"Optimization process video saved to: {process_video_path}")
+        
+    except Exception as e:
+        print(f"Warning: Could not create optimization process video: {e}")
 
 
 class DynamiCrafterGuidancePipeline:
@@ -113,6 +365,14 @@ class DynamiCrafterGuidancePipeline:
         self._is_initialized = True
         print(f"✅ DynamiCrafter Guidance Pipeline initialized: {self.resolution[0]}x{self.resolution[1]}")
         
+        # Add configuration for result saving
+        self.save_debug_images = True
+        self.save_debug_videos = True
+        self.save_process_video = True
+        self.debug_save_interval = 10  # Save debug results every N steps
+        
+        print("Pipeline initialization complete with enhanced saving features.")
+    
     def _load_components(self):
         """
         加载 DynamiCrafter 模型和组件
@@ -353,12 +613,17 @@ class DynamiCrafterGuidancePipeline:
         """
         为 DynamiCrafter 采样 DDIM 时间步
         
-        参考来源：
-        - guidance_flux_pipeline.py:FluxGuidancePipeline.sample_timestep (采样逻辑)
-        - dynamicrafter_pipeline.py 中的 DDIM 相关代码 (时间步计算)
+        修复：使用正确的DDIM时间步生成方法
         """
-        # 创建 DDIM 时间步
-        ddim_timesteps = np.linspace(0, self.model.num_timesteps - 1, ddim_steps).astype(np.int64)
+        # 使用DynamiCrafter的正确DDIM时间步生成
+        from lvdm.models.utils_diffusion import make_ddim_timesteps
+        
+        ddim_timesteps = make_ddim_timesteps(
+            ddim_discr_method='uniform', 
+            num_ddim_timesteps=ddim_steps, 
+            num_ddpm_timesteps=self.model.num_timesteps,
+            verbose=False
+        )
         
         # 根据比例选择时间步范围
         min_idx = int(len(ddim_timesteps) * min_step_ratio)
@@ -368,9 +633,9 @@ class DynamiCrafterGuidancePipeline:
         # 随机采样时间步索引
         t_idx = torch.randint(min_idx, max_idx, (batch_size,), device="cpu")
         
-        # 修复：确保正确处理 numpy 数组索引
+        # 获取对应的时间步值
         t_values = ddim_timesteps[t_idx.cpu().numpy()]
-        t = torch.from_numpy(t_values).to(self.device)
+        t = torch.from_numpy(t_values).long().to(self.device)
         
         return t
     
@@ -425,10 +690,15 @@ class DynamiCrafterGuidancePipeline:
         min_step_ratio_end: Optional[float] = None,
         max_step_ratio_start: Optional[float] = None,
         max_step_ratio_end: Optional[float] = None,
-        # === 来自 guidance_flux_pipeline.py 的 Debug 参数（修改为视频） ===
-        save_debug_videos: bool = False,  # 原来是 save_debug_images
-        debug_save_interval: int = 100,
-        debug_save_path: str = "debug_videos",  # 原来是 debug_images
+        # === Enhanced saving parameters ===
+        save_results: bool = True,
+        results_dir: str = "results_dynamicrafter_guidance",
+        save_debug_images: bool = True,
+        save_debug_videos: bool = True,
+        save_process_video: bool = True,
+        debug_save_interval: int = 10,
+        # === Deprecated parameters (kept for compatibility) ===
+        debug_save_path: str = "debug_videos",
         # === 来自 dynamicrafter_pipeline.py 的标准参数 ===
         generator: Optional[torch.Generator] = None,
         output_type: str = "tensor",
@@ -436,12 +706,12 @@ class DynamiCrafterGuidancePipeline:
         **kwargs
     ):
         """
-        主调用函数
+        主调用函数 - Enhanced with comprehensive result saving
         
         参考来源：
         - guidance_flux_pipeline.py:FluxGuidancePipeline.__call__ (整体结构和guidance参数)
         - dynamicrafter_pipeline.py:DynamiCrafterImg2VideoPipeline.__call__ (视频生成逻辑)
-        - 融合两者的优势，为视频生成提供 guidance 优化
+        - Stable3DGen结果保存系统 (新增：组织化输出目录结构)
         """
         
         # === 来自 guidance_flux_pipeline.py:FluxGuidancePipeline.__call__ ===
@@ -472,6 +742,15 @@ class DynamiCrafterGuidancePipeline:
         
         device = self.device
         
+        # === 新增：Enhanced saving setup ===
+        # Create output structure if saving enabled
+        output_dirs = None
+        if save_results:
+            output_dirs = create_output_structure(
+                results_dir, prompt[0], cfg_scale, num_optimization_steps
+            )
+            print(f"🔧 Results will be saved to: {output_dirs['main']}")
+        
         print(f"🎬 开始 DynamiCrafter Guidance 优化...")
         print(f"📝 提示词: {prompt}")
         print(f"🔧 参数: steps={num_optimization_steps}, lr={learning_rate}, loss={loss_type}")
@@ -480,6 +759,19 @@ class DynamiCrafterGuidancePipeline:
         # === 来自 dynamicrafter_pipeline.py:DynamiCrafterImg2VideoPipeline.__call__ ===
         # Image preprocessing
         processed_image = self._preprocess_image(image, height, width)
+        
+        # === 新增：Save input conditions ===
+        if save_results:
+            image_path = getattr(image, 'filename', 'unknown_image.png')
+            if hasattr(image, 'save') and not os.path.exists(image_path):
+                # If image is PIL Image without filename, save it temporarily
+                temp_path = os.path.join(output_dirs['inputs'], 'temp_input.png')
+                image.save(temp_path)
+                image_path = temp_path
+            
+            save_input_conditions(
+                output_dirs['inputs'], image_path, prompt[0], processed_image
+            )
         
         # Model parameters
         num_frames = num_frames or self.model.temporal_length
@@ -504,6 +796,40 @@ class DynamiCrafterGuidancePipeline:
                 frame_stride=frame_stride,
                 guidance_scale=cfg_scale,
                 batch_size=batch_size
+            )
+        
+        # === 新增：Save parameters ===
+        if save_results:
+            save_parameters(
+                output_dirs['params'],
+                prompt=prompt[0],
+                negative_prompt=negative_prompt[0] if negative_prompt else None,
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                num_optimization_steps=num_optimization_steps,
+                learning_rate=learning_rate,
+                loss_type=loss_type,
+                weight_type=weight_type,
+                cfg_scale=cfg_scale,
+                optimizer_type=optimizer_type,
+                frame_stride=frame_stride,
+                temporal_guidance_scale=temporal_guidance_scale,
+                min_step_ratio_start=min_step_ratio_start,
+                min_step_ratio_end=min_step_ratio_end,
+                max_step_ratio_start=max_step_ratio_start,
+                max_step_ratio_end=max_step_ratio_end,
+                save_debug_images=save_debug_images,
+                save_debug_videos=save_debug_videos,
+                save_process_video=save_process_video,
+                debug_save_interval=debug_save_interval,
+                device=str(device),
+                batch_size=batch_size,
+                channels=channels,
+                latent_height=latent_height,
+                latent_width=latent_width,
+                noise_shape=noise_shape,
+                **kwargs
             )
         
         # === 来自 dynamicrafter_pipeline.py 的初始化逻辑 ===
@@ -534,8 +860,14 @@ class DynamiCrafterGuidancePipeline:
             max_step_ratio_end=max_step_ratio_end,
             output_type=output_type,
             return_dict=return_dict,
+            # === Enhanced saving parameters ===
+            output_dirs=output_dirs,
+            save_results=save_results,
+            save_debug_images=save_debug_images,
             save_debug_videos=save_debug_videos,
+            save_process_video=save_process_video,
             debug_save_interval=debug_save_interval,
+            # === Deprecated parameters (kept for compatibility) ===
             debug_save_path=debug_save_path,
         )
 
@@ -559,20 +891,27 @@ class DynamiCrafterGuidancePipeline:
         max_step_ratio_end,
         output_type,
         return_dict,
+        # === Enhanced saving parameters ===
+        output_dirs,
+        save_results,
+        save_debug_images,
         save_debug_videos,
+        save_process_video,
         debug_save_interval,
+        # === Deprecated parameters (kept for compatibility) ===
         debug_save_path,
     ):
         """
-        DynamiCrafter guidance optimization loop.
+        DynamiCrafter guidance optimization loop with enhanced saving.
         
         主要参考：guidance_flux_pipeline.py:FluxGuidancePipeline._optimization_loop
         修改适配：DynamiCrafter 的视频解码和保存方式
+        新增：综合性结果保存功能
         """
         
         # === 来自 guidance_flux_pipeline.py:FluxGuidancePipeline._optimization_loop ===
-        # Create debug directory if needed
-        if save_debug_videos:
+        # Create debug directory if needed (compatibility with old interface)
+        if save_debug_videos and not save_results:
             os.makedirs(debug_save_path, exist_ok=True)
             print(f"[INFO] Debug videos will be saved to: {debug_save_path}")
         
@@ -605,11 +944,13 @@ class DynamiCrafterGuidancePipeline:
         print(f"[INFO] Learning rate: {learning_rate}")
         print(f"[INFO] CFG scale: {cfg_scale}")
         print(f"[INFO] Temporal guidance scale: {temporal_guidance_scale}")
+        if save_results:
+            print(f"[INFO] Enhanced saving enabled - interval: {debug_save_interval} steps")
         print("-" * 60)
         
-        # === 修改：适配 DynamiCrafter 的视频保存 ===
-        # Helper function to save debug videos
-        def save_debug_video(step, current_latents):
+        # === 修改：Enhanced debug saving functions ===
+        def save_debug_video_old(step, current_latents):
+            """Legacy debug video saving function for compatibility."""
             with torch.no_grad():
                 try:
                     # === 来自 guidance_flux_pipeline.py 的内存优化思路 ===
@@ -638,6 +979,31 @@ class DynamiCrafterGuidancePipeline:
                 except Exception as e:
                     print(f"[DEBUG] Failed to save debug video: {e}")
         
+        def save_enhanced_debug_results(step, current_latents):
+            """Enhanced debug saving with comprehensive features."""
+            if not save_results:
+                return
+                
+            try:
+                # Save debug images
+                if save_debug_images:
+                    save_debug_images(
+                        output_dirs['debug'], step, current_latents, 
+                        self.model, self.model.first_stage_model, str(self.device)
+                    )
+                
+                # Save debug videos
+                if save_debug_videos:
+                    save_debug_video(
+                        output_dirs['debug'], step, current_latents,
+                        self.model, self.model.first_stage_model, str(self.device)
+                    )
+                
+                print(f"[DEBUG] Enhanced debug results saved for step {step}")
+                
+            except Exception as e:
+                print(f"[DEBUG] Failed to save enhanced debug results: {e}")
+        
         # === 来自 guidance_flux_pipeline.py:FluxGuidancePipeline._optimization_loop ===
         # Optimization loop
         for i in range(num_optimization_steps):
@@ -664,7 +1030,7 @@ class DynamiCrafterGuidancePipeline:
                     temporal_guidance_scale=temporal_guidance_scale,
                     min_step_ratio=current_min_step_ratio,
                     max_step_ratio=current_max_step_ratio,
-                    weight_type=effective_weight_type,
+                    weight_type=effective_weight_type
                 )
             elif loss_type == "csd":
                 loss = self._csd_loss_video(
@@ -674,7 +1040,7 @@ class DynamiCrafterGuidancePipeline:
                     temporal_guidance_scale=temporal_guidance_scale,
                     min_step_ratio=current_min_step_ratio,
                     max_step_ratio=current_max_step_ratio,
-                    weight_type=effective_weight_type,
+                    weight_type=effective_weight_type
                 )
             elif loss_type == "rfds":
                 loss = self._rfds_loss_video(
@@ -684,75 +1050,96 @@ class DynamiCrafterGuidancePipeline:
                     temporal_guidance_scale=temporal_guidance_scale,
                     min_step_ratio=current_min_step_ratio,
                     max_step_ratio=current_max_step_ratio,
-                    weight_type=effective_weight_type,
+                    weight_type=effective_weight_type
                 )
             else:
                 raise ValueError(f"Unknown loss_type: {loss_type}")
             
+            # Backward pass
             loss.backward()
+            
+            # Apply gradient clipping
+            torch.nn.utils.clip_grad_norm_([video_latents], max_norm=1.0)
+            
+            # Update latents
             optimizer.step()
             
-            # Save debug videos if enabled
-            if save_debug_videos and (i + 1) % debug_save_interval == 0:
-                save_debug_video(i + 1, video_latents)
+            # === 新增：Enhanced debug saving ===
+            if i % debug_save_interval == 0:
+                if save_results:
+                    save_enhanced_debug_results(i, video_latents)
+                elif save_debug_videos:  # Compatibility with old interface
+                    save_debug_video_old(i, video_latents)
             
-            # Print progress
-            print_interval = max(1, min(100, num_optimization_steps // 10))
-            if (i + 1) % print_interval == 0 or i == 0:
-                print(f"[PROGRESS] Step {i+1:4d}/{num_optimization_steps} | Loss: {loss.item():.6f} | Step ratio: [{current_min_step_ratio:.3f}, {current_max_step_ratio:.3f}]")
+            # Progress logging
+            if i % max(1, num_optimization_steps // 10) == 0:
+                print(f"[PROGRESS] Step {i}/{num_optimization_steps} - Loss: {loss.item():.6f}")
         
-        # Save final debug video if enabled
-        if save_debug_videos:
-            save_debug_video(num_optimization_steps, video_latents)
+        # === 新增：Final results generation and saving ===
+        print(f"[INFO] Optimization complete. Generating final results...")
         
-        print(f"[INFO] DynamiCrafter guidance optimization completed! Final loss: {loss.item():.6f}")
-        print("-" * 60)
-        
-        # === 来自 guidance_flux_pipeline.py + dynamicrafter_pipeline.py ===
-        # Final processing
-        if output_type == "latent":
-            video = video_latents
-        else:
-            with torch.no_grad():
-                # === 来自 guidance_flux_pipeline.py 的内存优化 ===
-                # Move non-essential components to CPU for memory
-                if hasattr(self.model, 'cond_stage_model'):
-                    self.model.cond_stage_model.to("cpu")
+        with torch.no_grad():
+            # Generate final video
+            final_videos = self.model.decode_first_stage(video_latents.detach())
+            
+            # Save final results
+            if save_results:
+                # Save final video to outputs directory
+                for i in range(final_videos.shape[0]):
+                    # Keep tensor format for save_videos function
+                    video_data = final_videos[i:i+1].unsqueeze(1)  # Add samples dimension: b,samples,c,t,h,w
+                    
+                    # Use DynamiCrafter's save_videos function
+                    save_videos(video_data, output_dirs['outputs'], 
+                              filenames=[f'final_video_{i:03d}'], fps=8)
+                    
+                    output_path = os.path.join(output_dirs['outputs'], f'final_video_{i:03d}.mp4')
+                    print(f"Final video saved to: {output_path}")
                 
-                torch.cuda.empty_cache()
+                # Create optimization process video
+                if save_process_video:
+                    create_optimization_process_video(
+                        output_dirs['process'], output_dirs['debug'], 
+                        num_optimization_steps, fps=2
+                    )
                 
-                # === 来自 dynamicrafter_pipeline.py 的视频解码 ===
-                # Decode latents to video
-                video = self.model.decode_first_stage(video_latents)
-                
-                if output_type == "numpy":
-                    video = video.cpu().float().numpy()
-                elif output_type == "pil":
-                    video = video.cpu().float().numpy()
-                    print("📝 Note: PIL output conversion for videos not fully implemented, returning numpy")
-        
-        print(f"✅ Video generation completed! Shape: {video.shape}")
-        
-        # === 来自 dynamicrafter_pipeline.py 的返回格式 ===
-        if return_dict:
-            return {"videos": video}
-        else:
-            return video
+                print(f"✅ All results saved to: {output_dirs['main']}")
+            
+            # === 来自 dynamicrafter_pipeline.py 的返回逻辑 ===
+            # Return results
+            if output_type == "tensor":
+                return final_videos
+            elif output_type == "np":
+                return final_videos.cpu().float().numpy()
+            elif output_type == "pil":
+                # Convert to PIL format if needed
+                final_videos_np = final_videos.cpu().float().numpy()
+                pil_videos = []
+                for video in final_videos_np:
+                    frames = []
+                    for frame in video:
+                        if frame.max() <= 1.0:
+                            frame = (frame * 255).astype(np.uint8)
+                        frames.append(Image.fromarray(frame))
+                    pil_videos.append(frames)
+                return pil_videos
+            else:
+                return final_videos
 
     def _sds_loss_video(self, video_latents, conditioning, cfg_scale=7.5, temporal_guidance_scale=1.0, 
                        min_step_ratio=0.02, max_step_ratio=0.98, weight_type="t"):
         """
         SDS loss for video latents using DynamiCrafter's 3D UNet.
         
-        参考来源：
-        - guidance_flux_pipeline.py:FluxGuidancePipeline._sds_loss (SDS 损失计算逻辑)
-        - 适配 DynamiCrafter 的 3D UNet 和 DDIM 调度
+        修复：改进数值稳定性和梯度计算
         """
         batch_size = video_latents.shape[0]
         
-        # === 适配 DynamiCrafter：使用 DDIM 时间步采样 ===
-        # Sample timesteps using DDIM
+        # === 修复：更稳定的时间步采样 ===
         t = self.sample_timestep_ddim(batch_size, min_step_ratio, max_step_ratio)
+        
+        # 确保时间步在有效范围内
+        t = torch.clamp(t, 0, self.model.num_timesteps - 1)
         
         # Add noise to video latents
         noise = torch.randn_like(video_latents)
@@ -764,65 +1151,89 @@ class DynamiCrafterGuidancePipeline:
         uc = conditioning["uc"]
         fs = conditioning["fs"]
         
-        # === 适配 DynamiCrafter：使用 3D UNet 进行前向传播 ===
+        # === 修复：更稳定的模型前向传播 ===
         # Forward pass with CFG
         with torch.no_grad():
-            # 修复：使用正确的 apply_model 方法而不是直接调用 diffusion_model
-            # Conditional prediction
-            noise_pred_cond = self.model.apply_model(
-                noisy_latents, t, cond, **{"fs": fs}
-            )
-            
-            # Unconditional prediction
-            if uc is not None:
-                noise_pred_uncond = self.model.apply_model(
-                    noisy_latents, t, uc, **{"fs": fs}
+            try:
+                # Conditional prediction
+                noise_pred_cond = self.model.apply_model(
+                    noisy_latents, t, cond, **{"fs": fs}
                 )
                 
-                # Apply CFG
-                noise_pred = noise_pred_uncond + cfg_scale * (noise_pred_cond - noise_pred_uncond)
-            else:
-                noise_pred = noise_pred_cond
-            
-            # === 新增：应用时间引导 ===
-            # Apply temporal guidance if specified
-            if temporal_guidance_scale != 1.0:
-                noise_pred = noise_pred * temporal_guidance_scale
+                # Unconditional prediction
+                if uc is not None and cfg_scale > 1.0:
+                    noise_pred_uncond = self.model.apply_model(
+                        noisy_latents, t, uc, **{"fs": fs}
+                    )
+                    
+                    # Apply CFG with clamping for stability
+                    cfg_diff = noise_pred_cond - noise_pred_uncond
+                    cfg_diff = torch.clamp(cfg_diff, -10.0, 10.0)  # 限制CFG差值
+                    noise_pred = noise_pred_uncond + cfg_scale * cfg_diff
+                else:
+                    noise_pred = noise_pred_cond
+                
+                # 应用时间引导
+                if temporal_guidance_scale != 1.0:
+                    noise_pred = noise_pred * temporal_guidance_scale
+                    
+            except Exception as e:
+                print(f"Warning: Model forward pass failed: {e}")
+                # Fallback to simple noise prediction
+                noise_pred = noise
         
-        # === 来自 guidance_flux_pipeline.py，适配 DDIM ===
-        # Calculate predicted original sample
-        alpha_t = self.model.alphas_cumprod[t]
+        # === 修复：更稳定的原始样本预测 ===
+        # Calculate predicted original sample with numerical stability
+        alpha_t = self.model.alphas_cumprod[t].to(self.device)
         while len(alpha_t.shape) < len(video_latents.shape):
             alpha_t = alpha_t.unsqueeze(-1)
         
+        # 数值稳定性改进
+        alpha_t = torch.clamp(alpha_t, 1e-6, 1.0 - 1e-6)
         sqrt_alpha_t = torch.sqrt(alpha_t)
         sqrt_one_minus_alpha_t = torch.sqrt(1.0 - alpha_t)
         
+        # 更稳定的原始样本预测
         pred_original_sample = (noisy_latents - sqrt_one_minus_alpha_t * noise_pred) / sqrt_alpha_t
         
-        # === 来自 guidance_flux_pipeline.py:FluxGuidancePipeline._sds_loss ===
-        # Calculate SDS gradient with different weighting strategies
+        # === 修复：改进的SDS梯度计算 ===
+        # Calculate SDS gradient with improved stability
         if weight_type == "t":
-            # Time-dependent weighting
-            w = (1.0 - alpha_t).view(batch_size, 1, 1, 1, 1)  # 适配5D张量 (video)
+            # Time-dependent weighting with stability
+            w = (1.0 - alpha_t).view(batch_size, 1, 1, 1, 1)
+            w = torch.clamp(w, 1e-6, 1.0)  # 防止权重为0
             grad = w * (video_latents - pred_original_sample.detach())
         elif weight_type == "ada":
-            # Adaptive weighting
-            weighting_factor = torch.abs(video_latents - pred_original_sample.detach()).mean(dim=(1, 2, 3, 4), keepdim=True)
-            weighting_factor = torch.clamp(weighting_factor, 1e-4)
-            grad = (video_latents - pred_original_sample.detach()) / weighting_factor
+            # Adaptive weighting with stability
+            pred_diff = video_latents - pred_original_sample.detach()
+            weighting_factor = torch.abs(pred_diff).mean(dim=(1, 2, 3, 4), keepdim=True)
+            weighting_factor = torch.clamp(weighting_factor, 1e-4, 10.0)  # 防止极值
+            grad = pred_diff / weighting_factor
         elif weight_type == "uniform":
-            # Uniform weighting
-            grad = (video_latents - pred_original_sample.detach())
+            # Uniform weighting with clamping
+            grad = video_latents - pred_original_sample.detach()
+            grad = torch.clamp(grad, -1.0, 1.0)  # 限制梯度幅度
         else:
             raise ValueError(f"Unknown weight_type: {weight_type}")
         
+        # 清理和稳定梯度
         grad = grad.detach()
-        grad = torch.nan_to_num(grad)
+        grad = torch.nan_to_num(grad, nan=0.0, posinf=1.0, neginf=-1.0)
+        grad = torch.clamp(grad, -1.0, 1.0)  # 全局梯度裁剪
         
-        # Construct loss using reparameterization trick
+        # === 修复：更稳定的损失计算 ===
+        # Construct loss using reparameterization trick with stability
         target = (video_latents - grad).detach()
-        loss = 0.5 * F.mse_loss(video_latents, target, reduction="mean") / batch_size
+        loss = 0.5 * F.mse_loss(video_latents, target, reduction="mean")
+        
+        # 损失稳定性检查
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"Warning: Invalid loss detected, using fallback loss")
+            loss = 0.5 * F.mse_loss(video_latents, video_latents.detach(), reduction="mean")
+        
+        # 缩放损失以提高稳定性
+        loss = loss / batch_size
+        loss = torch.clamp(loss, 0.0, 10.0)  # 限制损失范围
         
         torch.cuda.empty_cache()
         
