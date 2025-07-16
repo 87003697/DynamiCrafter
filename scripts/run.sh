@@ -5,7 +5,7 @@ name=dynamicrafter_$1_seed${seed}
 ckpt=checkpoints/dynamicrafter_$1_v1/model.ckpt
 config=configs/inference_$1_v1.0.yaml
 
-prompt_dir=prompts/$1/
+prompt_dir=prompts/test/ # prompts/$1/
 res_dir="results"
 
 if [ "$1" == "256" ]; then
@@ -23,7 +23,7 @@ else
 fi
 
 if [ "$1" == "256" ]; then
-CUDA_VISIBLE_DEVICES=0 python3 scripts/evaluation/inference.py \
+CUDA_VISIBLE_DEVICES=5 python3 scripts/evaluation/inference.py \
 --seed ${seed} \
 --ckpt_path $ckpt \
 --config $config \

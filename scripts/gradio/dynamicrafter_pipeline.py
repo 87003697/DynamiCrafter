@@ -84,7 +84,7 @@ class DynamiCrafterImg2VideoPipeline:
         Initialize the DynamiCrafter pipeline.
         
         Args:
-            resolution: Model resolution (e.g., '256_256', '512_512', '1024_1024')
+            resolution: Model resolution (e.g., '256_256', '320_512', '576_1024')
             device: Device to run the model on
             dtype: Data type for the model
         """

@@ -37,6 +37,39 @@ device = get_device()
 print(f"[DEBUG] Using device: {device}")
 
 
+def get_correct_frame_stride(resolution):
+    """根据分辨率返回正确的 frame_stride，与标准inference一致"""
+    if resolution == "256_256":
+        return 3
+    elif resolution == "320_512":
+        return 24  # 🔥 512模型的正确值
+    elif resolution == "576_1024":
+        return 10
+    else:
+        print(f"[WARNING] Unknown resolution {resolution}, using default frame_stride=3")
+        return 3
+
+
+def validate_parameters(args):
+    """验证和修正参数，确保与标准inference一致"""
+    # 自动设置 frame_stride（如果未指定）
+    if args.frame_stride is None:
+        args.frame_stride = get_correct_frame_stride(args.resolution)
+        print(f"[INFO] Auto-set frame_stride={args.frame_stride} for resolution {args.resolution}")
+    
+    # 验证 frame_stride 是否正确
+    expected_fs = get_correct_frame_stride(args.resolution)
+    if args.frame_stride != expected_fs:
+        print(f"[WARNING] frame_stride={args.frame_stride} may not be optimal for {args.resolution}")
+        print(f"[WARNING] Standard value is {expected_fs}")
+    
+    # 确保 cfg_scale 与 guidance_scale 的合理性
+    if args.cfg_scale > 15:
+        print(f"[WARNING] cfg_scale={args.cfg_scale} is very high, may cause over-saturation")
+    
+    return args
+
+
 def seed_everything(seed):
     random.seed(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
@@ -62,16 +95,16 @@ def create_parser():
                        help="Random seed for reproducibility")
 
     # DynamiCrafter specific parameters
-    parser.add_argument("--resolution", type=str, default="256_256", choices=["256_256", "512_512", "1024_1024"],
+    parser.add_argument("--resolution", type=str, default="256_256", choices=["256_256", "320_512", "576_1024"],
                        help="Model resolution")
     parser.add_argument("--num_frames", type=int, default=16,
                        help="Number of frames to generate")
-    parser.add_argument("--frame_stride", type=int, default=3,
-                       help="Frame stride parameter")
+    parser.add_argument("--frame_stride", type=int, default=None,
+                       help="Frame stride parameter (auto-set based on resolution if None). Standard: 256→3, 512→24, 1024→10")
     parser.add_argument("--guidance_scale", type=float, default=7.5,
                        help="DynamiCrafter guidance scale")
-    parser.add_argument("--eta", type=float, default=0.0,
-                       help="DDIM eta parameter")
+    parser.add_argument("--eta", type=float, default=1.0,
+                       help="DDIM eta parameter (standard inference uses 1.0)")
 
     # Guidance optimization parameters
     parser.add_argument("--num_optimization_steps", type=int, default=1000,
@@ -127,6 +160,9 @@ def main():
     parser = create_parser()
     args = parser.parse_args()
 
+    # 🔧 FIX: 验证和修正参数，确保与标准inference一致
+    args = validate_parameters(args)
+
     # Enhanced device selection
     if args.device is not None:
         device = torch.device(args.device)
@@ -141,17 +177,29 @@ def main():
 
     print(f"[INFO] Starting DynamiCrafter guidance generation...")
     print(f"[INFO] Resolution: {args.resolution}")
+    print(f"[INFO] Frame stride: {args.frame_stride} (standard for {args.resolution})")
     print(f"[INFO] Loss type: {args.loss_type}")
     print(f"[INFO] Weight type: {args.weight_type}")
     print(f"[INFO] Optimization steps: {args.num_optimization_steps}")
     print(f"[INFO] Learning rate: {args.learning_rate}")
     print(f"[INFO] CFG scale: {args.cfg_scale}")
+    print(f"[INFO] Guidance scale: {args.guidance_scale}")
+    print(f"[INFO] ETA: {args.eta}")
 
     # --- 1. Setup Pipeline ---
     print("[INFO] Loading DynamiCrafter Guidance Pipeline...")
+    
+    # 🔧 FIX: 启用debug模式，使用完整的debug功能
+    debug_dir = None
+    if args.save_results or args.save_debug_images or args.save_debug_videos:
+        # 如果启用了任何保存功能，就启用我们的debug模式
+        debug_dir = args.results_dir if args.results_dir else "./results_dynamicrafter_guidance"
+        print(f"[INFO] 🐛 Debug mode enabled: {debug_dir}")
+    
     pipeline = DynamiCrafterGuidancePipeline(
         resolution=args.resolution,
-        device=str(device)  # Pass device as string
+        device=str(device),
+        debug_dir=debug_dir  # 🔥 添加debug_dir参数
     )
     print("[INFO] Pipeline loaded successfully")
 
@@ -203,6 +251,13 @@ def main():
     # --- 4. Run Generation ---
     print(f"[INFO] Starting generation with {args.loss_type} loss...")
     print(f"[INFO] Using {args.loss_type.upper()}-{effective_weight_type.upper()} loss")
+    
+    # 🔧 FIX: 最终参数一致性检查
+    expected_fs = get_correct_frame_stride(args.resolution)
+    if args.frame_stride == expected_fs:
+        print(f"[INFO] ✅ Frame stride ({args.frame_stride}) matches standard inference")
+    else:
+        print(f"[WARNING] ⚠️  Frame stride ({args.frame_stride}) differs from standard ({expected_fs})")
 
     start_time = time.time()
     
@@ -225,18 +280,7 @@ def main():
         cfg_scale=args.cfg_scale,
         optimizer_type=args.optimizer_type,
         
-        # Dynamic step ratio parameters
-        min_step_ratio_start=args.min_step_ratio_start,
-        min_step_ratio_end=args.min_step_ratio_end,
-        max_step_ratio_start=args.max_step_ratio_start,
-        max_step_ratio_end=args.max_step_ratio_end,
-        
-        # Enhanced saving parameters
-        save_results=args.save_results,
-        results_dir=args.results_dir,
-        save_debug_images=args.save_debug_images,
-        save_debug_videos=args.save_debug_videos,
-        save_process_video=args.save_process_video,
+        # 🔧 FIX: 只传递我们的pipeline支持的参数
         debug_save_interval=args.debug_save_interval,
         
         # Output parameters
@@ -250,10 +294,27 @@ def main():
     # --- 5. Save Results ---
     print("[INFO] Saving final results...")
     
-    # Save final video using pipeline's save function
+    # 🔧 FIX: 使用标准方法保存视频（我们的pipeline没有save_video方法）
     final_videos = result["videos"]
     final_video_path = os.path.join(save_dir, "final_video.mp4")
-    pipeline.save_video(final_videos, final_video_path, fps=8)
+    
+    # 手动保存视频
+    videos_np = final_videos.detach().cpu().numpy()
+    videos_np = np.clip((videos_np + 1.0) / 2.0, 0, 1)
+    
+    import cv2
+    batch_size, channels, num_frames, height, width = videos_np.shape
+    video_np = videos_np[0].transpose(1, 2, 3, 0)  # [T, H, W, C]
+    
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(final_video_path, fourcc, 8.0, (width, height))
+    
+    for frame_idx in range(num_frames):
+        frame = (video_np[frame_idx] * 255).astype(np.uint8)
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        out.write(frame_bgr)
+    
+    out.release()
     print(f"[INFO] Final video saved to: {final_video_path}")
 
     # Check for NaN values
@@ -283,6 +344,10 @@ def main():
     print("="*60)
     print(f"✅ Model: DynamiCrafter {args.resolution}")
     print(f"✅ Loss type: {args.loss_type.upper()}-{effective_weight_type.upper()}")
+    print(f"✅ Frame stride: {args.frame_stride} ({'✅ Standard' if args.frame_stride == expected_fs else '⚠️ Non-standard'})")
+    print(f"✅ Guidance scale: {args.guidance_scale}")
+    print(f"✅ ETA: {args.eta}")
+    print(f"✅ CFG scale: {args.cfg_scale}")
     print(f"✅ Optimization steps: {args.num_optimization_steps}")
     print(f"✅ Learning rate: {args.learning_rate}")
     print(f"✅ Video shape: {final_videos.shape}")

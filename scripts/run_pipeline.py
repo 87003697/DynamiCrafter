@@ -73,14 +73,14 @@ def get_resolution_config(resolution):
             'height': 320,
             'width': 512,
             'frame_stride': 24,
-            'resolution_str': '512_512'
+            'resolution_str': '320_512'
         }
     elif resolution == '1024':
         return {
             'height': 576,
             'width': 1024,
             'frame_stride': 10,
-            'resolution_str': '1024_1024'
+            'resolution_str': '576_1024'
         }
     else:
         raise ValueError(f"Unsupported resolution: {resolution}")
