@@ -9,10 +9,10 @@ IMAGE="prompts/test/4.png"
 PROMPT="A fat man is drinking beer"
 
 # 🔧 FIX: 使用正确的分辨率设置
-RESOLUTION="320_512"  # 修复：对于 512 模型使用正确的分辨率
+RESOLUTION="256_256"  # 修复：对于 512 模型使用正确的分辨率
 
 # 🔧 FIX: 使用与标准inference一致的参数
-FRAME_STRIDE=24       # 🔥 修复：512模型必须用24，不是3
+FRAME_STRIDE=3       # 🔥 修复：512模型必须用24，不是3
 GUIDANCE_SCALE=7.5    # 🔥 修复：使用标准值7.5
 CFG_SCALE=7.5         # 🔥 修复：与guidance_scale一致
 ETA=1.0               # 🔥 修复：使用标准值1.0，不是0.0
@@ -37,7 +37,7 @@ python generate_dynamicrafter_pipeline.py \
     --eta $ETA \
     --num_optimization_steps 1000 \
     --learning_rate 0.05 \
-    --loss_type sds \
+    --loss_type csd \
     --weight_type t \
     --cfg_scale $CFG_SCALE \
     --device cuda:3 \
